@@ -9,8 +9,8 @@ import analysis
 import fixer
 import git_ops
 import redis_store
-from agent import AEO_PROMPT, GEO_PROMPT, SEO_PROMPT, run_full_audit
-from crawler import scan_page
+from agent import AEO_PROMPT, GEO_PROMPT, SEO_PROMPT, run_full_audit, run_site_audit
+from crawler import crawl_site, scan_page
 
 st.set_page_config(page_title="SEO + GEO + AEO Multi-Agent Audit", page_icon="🔍", layout="wide")
 
@@ -56,56 +56,76 @@ with st.sidebar:
     with tab_geo:
         st.text_area("GEO agent prompt", key="geo_prompt", height=340)
 
-url = st.text_input("Page URL", placeholder="https://example.com/page")
+mode = st.radio("Audit mode", ["Single page", "Full site"], horizontal=True)
+url = st.text_input("URL", placeholder="https://example.com" if mode == "Full site" else "https://example.com/page")
+max_pages = st.number_input("Max pages to crawl", 1, 1000, 100) if mode == "Full site" else None
 
 if st.button("Run Full Audit", type="primary"):
     if not url.strip():
         st.warning("Please enter a URL.")
         st.stop()
 
-    with st.spinner("Scanning page (content, schema, meta, robots.txt, sitemap)..."):
-        result = scan_page(url.strip())
-    if "error" in result:
-        st.error(result["error"])
-        st.stop()
-
-    domain, scanned_url = result["domain"], result["url"]
-    page = redis_store.get_page(domain, scanned_url)
-
-    with st.spinner("Running SEO, AEO & GEO agents in parallel..."):
-        out = run_full_audit(
-            domain, scanned_url,
-            st.session_state["seo_prompt"], st.session_state["aeo_prompt"],
-            st.session_state["geo_prompt"], reflect,
-        )
-
-    # Persist the whole audit so the report (and the Auto-Fix section) survive reruns.
-    st.session_state["last_audit"] = {
-        "url": scanned_url, "domain": domain,
-        "stats": {"Words": page["word_count"], "Headings": len(page["headings"]),
-                  "Schema types": len(page["schema_types"]), "Images no alt": page["images_missing_alt"]},
-        "sections": out["sections"], "scores": out["scores"],
-        "composite": out["composite"], "summary": out["summary"],
-    }
+    if mode == "Full site":
+        with st.spinner(f"Crawling site (up to {max_pages} pages, polite)..."):
+            result = crawl_site(url.strip(), max_pages=int(max_pages))
+        if "error" in result:
+            st.error(result["error"])
+            st.stop()
+        domain = result["domain"]
+        with st.spinner(f"Auditing {result['pages_crawled']} pages with SEO, AEO & GEO agents..."):
+            out = run_site_audit(domain, reflect)
+        st.session_state["last_audit"] = {
+            "mode": "site", "url": domain, "domain": domain,
+            "stats": {"Pages": result["pages_crawled"]},
+            "checklists": analysis.site_summary(domain),
+            "sections": out["sections"], "scores": out["scores"],
+            "composite": out["composite"], "summary": out["summary"],
+        }
+    else:
+        with st.spinner("Scanning page (content, schema, meta, robots.txt, sitemap)..."):
+            result = scan_page(url.strip())
+        if "error" in result:
+            st.error(result["error"])
+            st.stop()
+        domain, scanned_url = result["domain"], result["url"]
+        page = redis_store.get_page(domain, scanned_url)
+        with st.spinner("Running SEO, AEO & GEO agents in parallel..."):
+            out = run_full_audit(
+                domain, scanned_url,
+                st.session_state["seo_prompt"], st.session_state["aeo_prompt"],
+                st.session_state["geo_prompt"], reflect,
+            )
+        st.session_state["last_audit"] = {
+            "mode": "page", "url": scanned_url, "domain": domain,
+            "stats": {"Words": page["word_count"], "Headings": len(page["headings"]),
+                      "Schema types": len(page["schema_types"]), "Images no alt": page["images_missing_alt"]},
+            "checklists": "\n\n".join([analysis.seo_checklist(domain, scanned_url),
+                                       analysis.aeo_checklist(domain, scanned_url),
+                                       analysis.geo_checklist(domain, scanned_url)]),
+            "sections": out["sections"], "scores": out["scores"],
+            "composite": out["composite"], "summary": out["summary"],
+        }
 
 # ----------------------------- Audit report (renders from session, persists) -----------------------------
 audit = st.session_state.get("last_audit")
 if audit:
-    st.success(f"Audited {audit['url']}")
+    label = "Audited site" if audit.get("mode") == "site" else "Audited"
+    st.success(f"{label}: {audit['url']}")
 
-    cols = st.columns(4)
-    for col, (label, val) in zip(cols, audit["stats"].items()):
-        col.metric(label, val)
+    cols = st.columns(len(audit["stats"]) or 1)
+    for col, (k, v) in zip(cols, audit["stats"].items()):
+        col.metric(k, v)
 
     scores = audit["scores"]
     sc = st.columns(4)
-    for col, (label, val) in zip(sc, [("SEO", scores["SEO"]), ("AEO", scores["AEO"]),
-                                      ("GEO", scores["GEO"]), ("Composite", audit["composite"])]):
-        col.markdown(score_card(label, val), unsafe_allow_html=True)
+    for col, (lbl, val) in zip(sc, [("SEO", scores["SEO"]), ("AEO", scores["AEO"]),
+                                    ("GEO", scores["GEO"]), ("Composite", audit["composite"])]):
+        col.markdown(score_card(lbl, val), unsafe_allow_html=True)
 
     st.markdown(audit["summary"])
 
-    t_seo, t_aeo, t_geo, t_check = st.tabs(["SEO report", "AEO report", "GEO report", "Checklists"])
+    t_seo, t_aeo, t_geo, t_check = st.tabs(["SEO report", "AEO report", "GEO report",
+                                            "Site summary" if audit.get("mode") == "site" else "Checklists"])
     with t_seo:
         st.markdown(with_100(audit["sections"]["SEO"]))
     with t_aeo:
@@ -113,9 +133,7 @@ if audit:
     with t_geo:
         st.markdown(with_100(audit["sections"]["GEO"]))
     with t_check:
-        st.code(analysis.seo_checklist(audit["domain"], audit["url"]))
-        st.code(analysis.aeo_checklist(audit["domain"], audit["url"]))
-        st.code(analysis.geo_checklist(audit["domain"], audit["url"]))
+        st.code(audit["checklists"])
 
 
 # ----------------------------- Auto-Fix (Claude Code → PR) — only after a report exists -----------------

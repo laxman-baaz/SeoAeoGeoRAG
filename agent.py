@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 import analysis
+import rag
 import redis_store
 import tools
 
@@ -184,6 +185,42 @@ SCORING RUBRIC: 90-100 = rich schema + entity/author signals + claim-first citab
 End with EXACTLY one final line: 'SCORE: <0-100>'."""
 
 
+SEO_SITE_PROMPT = """You are a senior TECHNICAL & ON-PAGE SEO auditor auditing an ENTIRE crawled website.
+Use the tools: get_site_summary FIRST (crawl-wide issue counts), then list_pages_with_issue to see which
+URLs are affected, get_page to inspect representative pages, get_examples / search_handbook for fixes.
+Focus on site-wide patterns: missing/short meta descriptions, missing/duplicate titles, multiple or missing H1s,
+missing canonicals, noindex leaks, thin pages, images missing alt, missing schema, sitemap/robots health.
+Report (markdown): 1. CRITICAL ISSUES (each: signal, the affected-page COUNT and a few example URLs, impact,
+a specific fix with an example). 2. IMPROVEMENTS. 3. TOP FIXES (prioritized by how many pages they help).
+Cite the real counts/URLs from the tools; never invent data.
+SCORING RUBRIC: 90-100 = nearly all pages clean; 70-89 = a few systemic gaps; 50-69 = several issues affecting many pages; below 50 = site-wide indexability/title/meta failures.
+End with EXACTLY one final line: 'SCORE: <0-100>'."""
+
+AEO_SITE_PROMPT = """You are an ANSWER ENGINE OPTIMIZATION (AEO) auditor auditing an ENTIRE crawled website
+for featured snippets, People Also Ask, and AI answer boxes.
+Use the tools: get_site_summary FIRST, then list_pages_with_issue (e.g. no_question_headings, no_faq_schema,
+thin_content), get_page to inspect pages, get_examples / search_handbook for fixes.
+Focus site-wide on: question-style headings, front-loaded 40-60 word answers, FAQ/QAPage schema coverage,
+scannable lists/tables, readability.
+Report (markdown): 1. CRITICAL GAPS (each: signal, affected-page count + example URLs, impact, a specific fix
+with an example - e.g. a rewritten question heading + 45-word answer). 2. IMPROVEMENTS. 3. TOP FIXES (prioritized).
+Cite real counts/URLs; never invent data.
+SCORING RUBRIC: 90-100 = most pages answer-ready; 70-89 = some structure missing across pages; 50-69 = sparse question/answer structure; below 50 = no answer structure site-wide.
+End with EXACTLY one final line: 'SCORE: <0-100>'."""
+
+GEO_SITE_PROMPT = """You are a GENERATIVE ENGINE OPTIMIZATION (GEO) auditor auditing an ENTIRE crawled website
+for how likely LLMs are to TRUST and CITE it.
+Use the tools: get_site_summary FIRST, then list_pages_with_issue (e.g. missing_schema, no_organization_schema,
+no_author_signal), get_page to inspect pages, get_examples / search_handbook for fixes.
+Focus site-wide on: structured data coverage, Organization schema + sameAs, author/Person signals, freshness,
+claim-first citable content, AI-crawler access (robots.txt).
+Report (markdown): 1. CRITICAL GAPS (each: signal, affected-page count + example URLs, impact, a specific fix
+with an example - claim-first rewrite or Organization+sameAs JSON-LD). 2. IMPROVEMENTS. 3. TOP FIXES (prioritized).
+Cite real counts/URLs; never invent data.
+SCORING RUBRIC: 90-100 = rich schema + entities site-wide; 70-89 = partial coverage; 50-69 = little schema/entity signal; below 50 = none.
+End with EXACTLY one final line: 'SCORE: <0-100>'."""
+
+
 REVIEW_PROMPT = """You are a meticulous QA reviewer of a {dim} audit report for {url}.
 
 GROUND-TRUTH DATA (the ONLY real, measured facts about this page):
@@ -200,9 +237,10 @@ DRAFT:
 {draft}
 """
 
-REVISE_MSG = """Below is your draft {dim} audit, the ground-truth data, and a reviewer's critique.
+REVISE_MSG = """Below is your draft {dim} audit, the ground-truth data, a reviewer's critique, and
+reference material retrieved from the handbook for the issues you found.
 
-GROUND-TRUTH DATA (the only real facts; never contradict it or go beyond it):
+GROUND-TRUTH DATA (the only real facts about this page/site; never contradict it or go beyond it):
 {evidence}
 
 DRAFT:
@@ -211,12 +249,17 @@ DRAFT:
 REVIEWER CRITIQUE:
 {critique}
 
-Rewrite into a FINAL, corrected report that fixes every valid point. Strict rules:
-- Use ONLY facts from the ground-truth data and the draft. Do NOT invent any metric (page speed, word
-  counts, load times, etc.) that is not in the ground-truth data; if something was not measured, omit it
-  or say so explicitly - never fabricate a number.
+REFERENCE MATERIAL - handbook guidance + worked Don't/Do examples relevant to your findings. Use these
+to make each fix more specific and correct; ADAPT the example patterns, but do NOT import their
+placeholder facts/brands (Acme, Northwind, etc.):
+{reference}
+
+Rewrite into a FINAL, corrected report that (a) fixes every valid point in the critique and (b) makes each
+fix more concrete by applying the reference material's best practices and example patterns. Strict rules:
+- Facts about THIS page/site must come ONLY from the ground-truth data and the draft. Never invent a metric
+  (page speed, word counts, etc.) that was not measured.
 - Keep the same required format and end with exactly one line 'SCORE: <0-100>'.
-Do not mention the review or revision process."""
+Do not mention the review, reference, or revision process."""
 
 
 def _evidence(domain, url, dim):
@@ -234,7 +277,7 @@ def _evidence(domain, url, dim):
     return f"{checklist}\n\n{facts}"
 
 
-def _run(tools_list, system_prompt, user_msg, dim, domain, url, reflect=True):
+def _run(tools_list, system_prompt, user_msg, dim, domain, url, reflect=True, evidence=None):
     llm = _llm()
     agent = create_agent(llm, tools_list, system_prompt=system_prompt)
 
@@ -244,17 +287,18 @@ def _run(tools_list, system_prompt, user_msg, dim, domain, url, reflect=True):
     if not reflect:
         return draft
 
-    # Phases 2-3 - reflect then revise. Plain LLM calls (no tools) so a flaky tool-call format
-    # can't break the audit; grounded in deterministic evidence so the reviser can't hallucinate.
-    # Any failure degrades gracefully to the draft.
+    # Phases 2-4 - reflect, RAG-retrieve, then revise. Plain LLM calls (no tools) so a flaky
+    # tool-call format can't break the audit; grounded in deterministic evidence so the reviser
+    # can't hallucinate. The revise step is augmented with handbook passages + examples retrieved
+    # from the draft (rag.reference_material). Any failure degrades gracefully to the draft.
     try:
-        evidence = _evidence(domain, url, dim)
+        evidence = evidence if evidence is not None else _evidence(domain, url, dim)
         critique = llm.invoke(REVIEW_PROMPT.format(dim=dim, url=url, evidence=evidence, draft=draft)).content
-        if "NO ISSUES" in critique.upper():
-            return draft
+        reference = rag.reference_material(dim, draft)
         final = llm.invoke([
             ("system", system_prompt),
-            HumanMessage(content=REVISE_MSG.format(dim=dim, evidence=evidence, draft=draft, critique=critique)),
+            HumanMessage(content=REVISE_MSG.format(dim=dim, evidence=evidence, draft=draft,
+                                                   critique=critique, reference=reference)),
         ]).content
         return final or draft
     except Exception:
@@ -297,19 +341,9 @@ def synthesize(url, sections, scores, composite):
     return llm.invoke(prompt).content
 
 
-def run_full_audit(domain, url, seo_prompt=SEO_PROMPT, aeo_prompt=AEO_PROMPT, geo_prompt=GEO_PROMPT,
-                   reflect=True, parallel=True):
-    """Run the three specialist agents (each with a reflection pass), then synthesize.
-    Parallel by default (OpenAI limits allow it) — wall-clock ~= the slowest single agent.
-    Each agent is isolated: one failure still returns the others."""
-    _prewarm(domain)  # build Chroma/Redis on the main thread before any worker thread uses them
-    jobs = {
-        "SEO": lambda: run_seo_agent(domain, url, seo_prompt, reflect),
-        "AEO": lambda: run_aeo_agent(domain, url, aeo_prompt, reflect),
-        "GEO": lambda: run_geo_agent(domain, url, geo_prompt, reflect),
-    }
+def _collect_and_synthesize(jobs, url, parallel):
+    """Run dimension jobs (parallel or sequential), score, and synthesize. Each job is isolated."""
     sections = {}
-
     if parallel:
         with ThreadPoolExecutor(max_workers=3) as ex:
             futures = {dim: ex.submit(fn) for dim, fn in jobs.items()}
@@ -333,3 +367,36 @@ def run_full_audit(domain, url, seo_prompt=SEO_PROMPT, aeo_prompt=AEO_PROMPT, ge
     except Exception as e:
         summary = f"(Executive summary unavailable: {e})"
     return {"sections": sections, "scores": scores, "composite": composite, "summary": summary}
+
+
+def run_full_audit(domain, url, seo_prompt=SEO_PROMPT, aeo_prompt=AEO_PROMPT, geo_prompt=GEO_PROMPT,
+                   reflect=True, parallel=True):
+    """Single-page audit: three specialist agents (each with reflection), then synthesize.
+    Parallel by default (OpenAI limits allow it) — wall-clock ~= the slowest single agent."""
+    _prewarm(domain)
+    jobs = {
+        "SEO": lambda: run_seo_agent(domain, url, seo_prompt, reflect),
+        "AEO": lambda: run_aeo_agent(domain, url, aeo_prompt, reflect),
+        "GEO": lambda: run_geo_agent(domain, url, geo_prompt, reflect),
+    }
+    return _collect_and_synthesize(jobs, url, parallel)
+
+
+def run_site_audit(domain, reflect=True, parallel=True):
+    """Full-site audit: three specialist agents reason over crawl-wide aggregates (site_tools),
+    each with a reflection pass grounded in the site summary, then synthesize."""
+    _prewarm(domain)
+    site_ev = analysis.site_summary(domain)
+    site = f"the entire site {domain}"
+
+    def _job(dim, prompt):
+        return _run(tools.site_tools(domain), prompt,
+                    f"Audit {dim} across {site} using the crawl aggregates.",
+                    dim, domain, domain, reflect, evidence=site_ev)
+
+    jobs = {
+        "SEO": lambda: _job("SEO", SEO_SITE_PROMPT),
+        "AEO": lambda: _job("AEO", AEO_SITE_PROMPT),
+        "GEO": lambda: _job("GEO", GEO_SITE_PROMPT),
+    }
+    return _collect_and_synthesize(jobs, site, parallel)

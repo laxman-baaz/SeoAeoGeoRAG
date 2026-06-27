@@ -4,7 +4,9 @@ meta tags, plus site-level robots.txt and sitemap.xml). All of it is stored in
 Redis (see redis_store) for the ReAct agent to reason over."""
 import json
 import re
+import time
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -223,3 +225,86 @@ def scan_page(url):
     })
 
     return {"domain": domain, "url": url}
+
+
+def _norm(u):
+    return u.split("#")[0].rstrip("/")
+
+
+def crawl_site(start_url, max_pages=100, delay=0.3):
+    """Polite breadth-first crawl of one site into Redis. Seeds from the sitemap + start URL,
+    follows same-domain internal links, respects robots.txt, sleeps between requests, and stops
+    at max_pages. Per-page content is trimmed (full-site memory/prompt size). Returns
+    {domain, pages_crawled} or {"error": ...}."""
+    parsed = urlparse(start_url)
+    if not parsed.scheme or not parsed.netloc:
+        return {"error": "Invalid URL. Include http:// or https:// (e.g. https://example.com)"}
+
+    domain = parsed.netloc
+    base = f"{parsed.scheme}://{domain}"
+
+    try:
+        redis_store.reset(domain)
+    except Exception as e:
+        return {"error": f"Redis not available ({e}). Check .env."}
+
+    robots_text = _fetch_text(base, "/robots.txt")
+    rp = RobotFileParser()
+    rp.parse(robots_text.splitlines() if robots_text else [])
+
+    def allowed(u):
+        try:
+            return rp.can_fetch(USER_AGENT, u)
+        except Exception:
+            return True
+
+    def same_domain(u):
+        p = urlparse(u)
+        return p.netloc == domain and p.scheme in ("http", "https")
+
+    sitemap_urls, sitemap_present = _collect_sitemap(base)
+    redis_store.enqueue(domain, _norm(start_url))
+    for u in sitemap_urls:
+        u = _norm(u)
+        if same_domain(u):
+            redis_store.enqueue(domain, u)
+
+    while redis_store.visited_count(domain) < max_pages:
+        url = redis_store.next_url(domain)
+        if url is None:
+            break
+        if not allowed(url):
+            continue
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+        except Exception:
+            continue
+        redis_store.mark_visited(domain, url)
+        if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        page = _extract_deep(url, soup, resp)
+        page["content"] = page["content"][:2000]          # trim for full-site memory/prompt size
+        page["schema_objects"] = page["schema_objects"][:3]
+        redis_store.save_page(domain, url, page)
+
+        for a in soup.find_all("a", href=True):
+            link = _norm(urljoin(url, a["href"]))
+            if same_domain(link):
+                redis_store.enqueue(domain, link)
+        time.sleep(delay)
+
+    pages_crawled = len(redis_store.page_urls(domain))
+    redis_store.set_meta(domain, {
+        "start_url": start_url, "domain": domain,
+        "robots_txt_present": robots_text is not None,
+        "robots_txt": (robots_text or "")[:4000],
+        "sitemap_present": sitemap_present,
+        "sitemap_url_count": len(sitemap_urls),
+        "pages_crawled": pages_crawled,
+    })
+
+    if pages_crawled == 0:
+        return {"error": f"Could not crawl any HTML pages from {start_url}"}
+    return {"domain": domain, "pages_crawled": pages_crawled}

@@ -73,3 +73,62 @@ def geo_checklist(domain, url):
         (p["word_count"] >= 300, "Citable depth (>=300 words)", f"{p['word_count']} words"),
     ]
     return _fmt("GEO checklist", url, checks)
+
+
+# ----------------------------- Site-level aggregates (full-site mode) -----------------------------
+# Predicate per issue over a single page's signals; counted across all crawled pages.
+SITE_ISSUES = {
+    "missing_meta_description": lambda p: p["meta_description_length"] == 0,
+    "short_meta_description": lambda p: 0 < p["meta_description_length"] < 120,
+    "missing_title": lambda p: p["title_length"] == 0,
+    "title_too_long": lambda p: p["title_length"] > 60,
+    "missing_h1": lambda p: p["h1_count"] == 0,
+    "multiple_h1": lambda p: p["h1_count"] > 1,
+    "missing_canonical": lambda p: not p["canonical"],
+    "noindex": lambda p: "noindex" in (p["meta_robots"] + " " + p["x_robots_tag"]).lower(),
+    "missing_schema": lambda p: not p["schema_types"],
+    "missing_open_graph": lambda p: not p["og"],
+    "images_missing_alt": lambda p: p["images_missing_alt"] > 0,
+    "thin_content": lambda p: p["word_count"] < 300,
+    "no_question_headings": lambda p: p.get("question_headings", 0) == 0,
+    "no_faq_schema": lambda p: not any(t in ("FAQPage", "QAPage") for t in p["schema_types"]),
+    "no_organization_schema": lambda p: "Organization" not in p["schema_types"],
+    "no_author_signal": lambda p: not p["has_author"],
+}
+
+
+def site_summary(domain):
+    pages = list(redis_store.iter_pages(domain))
+    n = len(pages)
+    meta = redis_store.get_meta(domain)
+    lines = [
+        f"Site: {domain}",
+        f"Pages crawled: {n}",
+        f"robots.txt: {'found' if meta.get('robots_txt_present') else 'MISSING'}",
+        f"sitemap.xml: {'found' if meta.get('sitemap_present') else 'MISSING'} ({meta.get('sitemap_url_count', 0)} URLs)",
+        "",
+        "Issue counts (affected pages / total):",
+    ]
+    for key, test in SITE_ISSUES.items():
+        lines.append(f"  {key}: {sum(1 for p in pages if test(p))}/{n}")
+
+    titles = {}
+    for p in pages:
+        t = p["title"].strip().lower()
+        if t:
+            titles.setdefault(t, []).append(p["url"])
+    dupes = sum(1 for urls in titles.values() if len(urls) > 1)
+    lines.append(f"  duplicate_titles: {dupes} title(s) shared across multiple pages")
+    return "\n".join(lines)
+
+
+def pages_with_issue(domain, issue, limit=50):
+    test = SITE_ISSUES.get(issue)
+    if not test:
+        return f"Unknown issue '{issue}'. Valid issues: {', '.join(SITE_ISSUES)}"
+    hits = [p["url"] for p in redis_store.iter_pages(domain) if test(p)]
+    shown = hits[:limit]
+    body = "\n".join(shown) if shown else "(none)"
+    if len(hits) > len(shown):
+        body += f"\n... and {len(hits) - len(shown)} more"
+    return f"{len(hits)} page(s) with {issue}:\n{body}"

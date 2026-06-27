@@ -222,3 +222,29 @@ def geo_tools(domain, url):
 
     return [get_geo_checklist, get_structured_data, get_entity_signals,
             get_ai_crawler_access, get_content, _handbook_tool(), _examples_tool()]
+
+
+# ----------------------------- Site-level tools (full-site mode) -----------------------------
+def site_tools(domain):
+    """Shared tools for the site-level agents: crawl-wide aggregates + drill into any page."""
+
+    @tool
+    def get_site_summary() -> str:
+        """Crawl-wide stats and per-issue counts across ALL crawled pages (start here).
+        Lists every issue key you can pass to list_pages_with_issue."""
+        return analysis.site_summary(domain)
+
+    @tool
+    def list_pages_with_issue(issue: str) -> str:
+        """List the URLs affected by an issue key (see get_site_summary for the valid keys)."""
+        return analysis.pages_with_issue(domain, issue)
+
+    @tool
+    def get_page(url: str) -> str:
+        """All extracted SEO/GEO/AEO signals for one specific crawled page URL."""
+        p = redis_store.get_page(domain, url)
+        if not p:
+            return f"No crawl data for {url}"
+        return json.dumps({k: v for k, v in p.items() if k != "schema_objects"}, indent=2)[:3000]
+
+    return [get_site_summary, list_pages_with_issue, get_page, _handbook_tool(), _examples_tool()]
