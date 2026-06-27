@@ -1,0 +1,21 @@
+# Secrets — NEVER commit
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated vector store (rebuild with: python vector_store.py)
+db/
+
+# Large / derived data
+handbook.html
+handbook_text.txt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
