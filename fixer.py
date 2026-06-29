@@ -49,14 +49,42 @@ AUDIT REPORTS:
 {reports}
 """
 
+CLAUDE_FIX_PROMPT_SITE = """You are fixing SEO, AEO and GEO issues across an ENTIRE Next.js (App Router) website.
+The audit below covers the WHOLE site {url} — many pages were crawled, and the issues span MULTIPLE routes.
 
-def run_claude_fix(repo_path, sections, url, timeout=900):
-    """Run Claude Code headless to edit the repo. Returns {ok, output}."""
+CRITICAL: the reports name SPECIFIC affected page URLs (e.g. /case-studies/..., /work1, /terms, /privacy,
+/erp/...). Do NOT just fix the home page. For EVERY affected route mentioned in the findings:
+- Map its URL path to the file under app/ (e.g. /case-studies/x -> app/case-studies/x/{{layout,page}}.js;
+  /work1 -> app/work1/{{layout,page}}.js; home -> app/layout.js / app/page.js).
+- Open that route's file and fix ITS issues across all three dimensions.
+
+Fix types: SEO (title ~50-60 chars, meta description ~120-160 + CTA, single H1, canonical, Open Graph,
+image alt), AEO (question-style headings + front-loaded answers, FAQ/QAPage JSON-LD), GEO (Organization
+JSON-LD + sameAs, author/Person signals, Article/WebPage schema, freshness).
+
+Rules:
+- Work through the affected routes systematically; fix as many as you can this run.
+- Make MINIMAL, correct edits matching existing code style; valid TS/JS.
+- If a signal is already adequate on a route, leave it. Do NOT invent unverifiable facts — skip and note it.
+- Do NOT run git or shell commands and do NOT install anything. Only edit source files.
+
+At the END, output a '## COVERAGE' section: per dimension (SEO/AEO/GEO), list the ROUTES/FILES you changed
+(and any routes skipped + why).
+
+AUDIT REPORTS:
+{reports}
+"""
+
+
+def run_claude_fix(repo_path, sections, url, mode="page", timeout=900):
+    """Run Claude Code headless to edit the repo. `mode='site'` fixes across all affected routes;
+    `mode='page'` fixes the single audited route. Returns {ok, output}."""
     claude = shutil.which("claude") or shutil.which("claude.exe")
     if not claude:
         raise RuntimeError("claude CLI not found on PATH.")
     reports = "\n\n".join(f"### {dim}\n{txt}" for dim, txt in sections.items())
-    prompt = CLAUDE_FIX_PROMPT.format(url=url, reports=reports)
+    template = CLAUDE_FIX_PROMPT_SITE if mode == "site" else CLAUDE_FIX_PROMPT
+    prompt = template.format(url=url, reports=reports)
     p = subprocess.run(
         [claude, "-p", "--permission-mode", "acceptEdits"],
         cwd=repo_path, input=prompt, capture_output=True, text=True, timeout=timeout,

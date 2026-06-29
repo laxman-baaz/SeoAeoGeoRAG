@@ -156,7 +156,8 @@ if audit:
                 with st.spinner(f"Preparing '{fixer.FIX_BRANCH}' branch..."):
                     fixer.prepare_branch(repo_path, base=base)
                 with st.spinner("Claude Code is editing the repo (this can take a minute)..."):
-                    res = fixer.run_claude_fix(repo_path, audit["sections"], audit["url"])
+                    res = fixer.run_claude_fix(repo_path, audit["sections"], audit["url"],
+                                               mode=audit.get("mode", "page"))
                 st.session_state["repo_path"] = repo_path
                 st.session_state["claude_ran"] = True
                 st.session_state["claude_out"] = res["output"]
