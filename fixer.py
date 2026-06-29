@@ -7,6 +7,7 @@ We keep the deterministic, controlled parts:
 
 The git diff Claude produces is shown for human approval before open_pr runs.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -90,6 +91,67 @@ def run_claude_fix(repo_path, sections, url, mode="page", timeout=900):
         cwd=repo_path, input=prompt, capture_output=True, text=True, timeout=timeout,
     )
     return {"ok": p.returncode == 0, "output": (p.stdout or "") + (p.stderr or "")}
+
+
+def _describe_tool(name, inp):
+    """Human-readable one-liner for a Claude tool call (for the live progress feed)."""
+    inp = inp or {}
+    if name in ("Edit", "Write", "MultiEdit"):
+        return f"✏️  {name} · {inp.get('file_path', '')}"
+    if name == "Read":
+        return f"📖  Read · {inp.get('file_path', '')}"
+    if name in ("Grep", "Glob"):
+        return f"🔎  {name} · {inp.get('pattern') or inp.get('query') or ''}"
+    if name == "Bash":
+        return f"💻  {str(inp.get('command', ''))[:80]}"
+    if name == "TodoWrite":
+        return "📝  planning…"
+    return f"🔧  {name}"
+
+
+def stream_claude_fix(repo_path, sections, url, mode="page", guidance=""):
+    """Run Claude Code headless with streamed events. Yields dicts:
+    {'type': 'tool'|'thinking'|'result'|'error', 'text': ...}. The agent edits files (acceptEdits)
+    and does NOT run git. `guidance` is extra human instruction prioritized for this run."""
+    claude = shutil.which("claude") or shutil.which("claude.exe")
+    if not claude:
+        yield {"type": "error", "text": "claude CLI not found on PATH."}
+        return
+
+    reports = "\n\n".join(f"### {dim}\n{txt}" for dim, txt in sections.items())
+    template = CLAUDE_FIX_PROMPT_SITE if mode == "site" else CLAUDE_FIX_PROMPT
+    prompt = template.format(url=url, reports=reports)
+    if guidance.strip():
+        prompt += f"\n\nADDITIONAL USER GUIDANCE (prioritize this over the generic plan):\n{guidance.strip()}"
+
+    proc = subprocess.Popen(
+        [claude, "-p", "--permission-mode", "acceptEdits",
+         "--output-format", "stream-json", "--verbose"],
+        cwd=repo_path, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+
+    final = ""
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if ev.get("type") == "assistant":
+            for item in ev.get("message", {}).get("content", []):
+                if item.get("type") == "text" and item.get("text", "").strip():
+                    yield {"type": "thinking", "text": item["text"].strip()}
+                elif item.get("type") == "tool_use":
+                    yield {"type": "tool", "text": _describe_tool(item.get("name"), item.get("input"))}
+        elif ev.get("type") == "result":
+            final = ev.get("result", "") or final
+    proc.wait()
+    yield {"type": "result", "text": final}
 
 
 def verify_build(repo_path, timeout=900):

@@ -136,79 +136,90 @@ if audit:
         st.code(audit["checklists"])
 
 
-# ----------------------------- Auto-Fix (Claude Code → PR) — only after a report exists -----------------
+# ----------------- Auto-Fix chat (Claude Code → PR) — only after a report exists -----------------
 if audit:
     st.divider()
     st.header("Auto-Fix → Pull Request (Claude Code)")
-    st.caption(f"Findings source: {audit['url']}")
+    st.caption(f"Findings source: {audit['url']} · chat with Claude to steer the fixes.")
     repo_path = st.text_input("Local repo path (a cloned Next.js repo)",
                               value=st.session_state.get("repo_path", ""))
     base = st.text_input("PR base branch", value="master")
+    st.session_state.setdefault("fix_chat", [])
 
-    if st.button("Run Claude fix"):
-        try:
-            if not git_ops.is_git_repo(repo_path):
-                st.error("That path is not a git repository.")
-            elif git_ops.has_changes(repo_path):
-                st.warning("The repo has uncommitted changes. Discard or commit them first so the "
-                           "diff shows only Claude's edits.")
-            else:
-                with st.spinner(f"Preparing '{fixer.FIX_BRANCH}' branch..."):
-                    fixer.prepare_branch(repo_path, base=base)
-                with st.spinner("Claude Code is editing the repo (this can take a minute)..."):
-                    res = fixer.run_claude_fix(repo_path, audit["sections"], audit["url"],
-                                               mode=audit.get("mode", "page"))
-                st.session_state["repo_path"] = repo_path
-                st.session_state["claude_ran"] = True
-                st.session_state["claude_out"] = res["output"]
-        except Exception as e:
-            st.error(f"Claude fix failed: {e}")
+    rp = st.session_state.get("repo_path") or repo_path
+    repo_ok = bool(rp) and git_ops.is_git_repo(rp)
+    changes = repo_ok and git_ops.has_changes(rp)
 
-    if st.session_state.get("claude_ran"):
-        rp = st.session_state["repo_path"]
-        out = st.session_state.get("claude_out") or ""
+    # --- conversation history ---
+    for m in st.session_state["fix_chat"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-        # Surface the per-dimension COVERAGE report so you can verify SEO + AEO + GEO were all handled.
-        parts = re.split(r"##+\s*COVERAGE", out, maxsplit=1, flags=re.I)
-        if len(parts) == 2:
-            st.markdown("#### Coverage (SEO / AEO / GEO)")
-            st.markdown(parts[1].strip()[:1500])
-        with st.expander("Full Claude output"):
-            st.text(out[-4000:])
+    # --- current uncommitted changes + PR controls ---
+    if changes:
+        files = git_ops.changed_files(rp)
+        with st.expander(f"📝 Pending changes on `{fixer.FIX_BRANCH}` ({len(files)} file(s))", expanded=True):
+            st.code(git_ops.diff(rp) or "(changes present)", language="diff")
+        run_build = st.checkbox("Verify with local build before PR", value=False)
+        c1, c2 = st.columns(2)
+        if c1.button("Approve → open PR", type="primary"):
+            if run_build:
+                with st.spinner("npm install + next build (slow)..."):
+                    ok, log = fixer.verify_build(rp)
+                (st.success if ok else st.warning)(
+                    "Build passed." if ok else "Build didn't pass locally; proceeding (GitHub CI will build).")
+                if not ok:
+                    with st.expander("Build log"):
+                        st.code(log)
+            with st.spinner("Branch → commit → push → PR..."):
+                try:
+                    st.success(f"PR opened: {fixer.open_pr(rp, audit['url'], base=base)}")
+                except Exception as e:
+                    st.error(f"PR step failed: {e}")
+        if c2.button("Discard changes"):
+            git_ops.discard(rp)
+            st.rerun()
 
-        diff = git_ops.diff(rp)
-        if not diff.strip() and not git_ops.has_changes(rp):
-            st.info("Claude made no changes.")
-        else:
-            st.subheader("Proposed changes — review before opening the PR")
-            st.code(diff or "(new files added; see changed files)", language="diff")
-            st.caption("Changed: " + ", ".join(git_ops.changed_files(rp)))
+    # --- chat input (pinned to the bottom; report scrolls above) ---
+    guidance = st.chat_input("Tell Claude what to fix or how (e.g. 'shorten titles on /erp/*, "
+                             "add author to /blog, leave /privacy alone') — or just send to fix everything.")
+    if guidance is not None:
+        if not (repo_path and git_ops.is_git_repo(repo_path)):
+            st.error("Enter a valid local repo path above first.")
+            st.stop()
+        st.session_state["repo_path"] = repo_path
+        if not git_ops.has_changes(repo_path):           # clean tree => start a fresh fix cycle on the branch
+            try:
+                fixer.prepare_branch(repo_path, base=base)
+            except Exception as e:
+                st.error(f"Could not prepare branch: {e}")
+                st.stop()
 
-            run_build = st.checkbox(
-                "Verify with local build before PR", value=False,
-                help="Runs npm install + next build (advisory). Many repos won't build locally without "
-                     "their env/setup; a failed build still lets you proceed — GitHub CI builds the PR.")
+        user_text = guidance.strip() or "_(fix everything in the audit)_"
+        st.session_state["fix_chat"].append({"role": "user", "content": user_text})
+        with st.chat_message("user"):
+            st.markdown(user_text)
 
-            c1, c2 = st.columns(2)
-            if c1.button("Approve → open PR", type="primary"):
-                if run_build:
-                    with st.spinner("npm install + next build (slow)..."):
-                        ok, log = fixer.verify_build(rp)
-                    if ok:
-                        st.success("Build passed.")
-                    else:
-                        st.warning("Local build did not pass (often a local env/deps issue). Proceeding; "
-                                   "GitHub CI will build the PR.")
-                        with st.expander("Build log"):
-                            st.code(log)
-                with st.spinner("Branch → commit → push → PR..."):
-                    try:
-                        pr_url = fixer.open_pr(rp, audit["url"], base=base)
-                        st.success(f"PR opened: {pr_url}")
-                        st.session_state["claude_ran"] = False
-                    except Exception as e:
-                        st.error(f"PR step failed: {e}")
-            if c2.button("Discard changes"):
-                git_ops.discard(rp)
-                st.session_state["claude_ran"] = False
-                st.rerun()
+        with st.chat_message("assistant"):
+            final = ""
+            with st.status("Claude is working…", expanded=True) as status:
+                for ev in fixer.stream_claude_fix(repo_path, audit["sections"], audit["url"],
+                                                  audit.get("mode", "page"), guidance):
+                    if ev["type"] == "tool":
+                        st.write(ev["text"])
+                    elif ev["type"] == "thinking":
+                        st.caption(ev["text"][:280])
+                    elif ev["type"] == "error":
+                        st.error(ev["text"])
+                    elif ev["type"] == "result":
+                        final = ev["text"]
+                status.update(label="Claude finished", state="complete")
+
+            cov = re.split(r"##+\s*COVERAGE", final, maxsplit=1, flags=re.I)
+            summary = ("**Coverage**\n\n" + cov[1].strip()[:1500]) if len(cov) == 2 else (final[-1500:] or "Done.")
+            changed = git_ops.changed_files(repo_path) if git_ops.has_changes(repo_path) else []
+            summary += ("\n\n**Changed:** " + ", ".join(changed)) if changed else "\n\n_No file changes this run._"
+            st.markdown(summary)
+
+        st.session_state["fix_chat"].append({"role": "assistant", "content": summary})
+        st.rerun()
