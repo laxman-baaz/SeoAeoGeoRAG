@@ -139,7 +139,7 @@ def aeo_tools(domain, url):
     def get_question_coverage() -> str:
         """Question-style headings and FAQ/QA structured data present on the page."""
         p = _page(domain, url)
-        qs = [h["text"] for h in p.get("headings", []) if h["text"].rstrip().endswith("?")]
+        qs = [h["text"] for h in p.get("headings", []) if "?" in h["text"]]
         return json.dumps({
             "question_headings_count": p.get("question_headings"),
             "question_headings": qs,
