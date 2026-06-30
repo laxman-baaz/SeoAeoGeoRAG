@@ -400,3 +400,70 @@ def run_site_audit(domain, reflect=True, parallel=True):
         "GEO": lambda: _job("GEO", GEO_SITE_PROMPT),
     }
     return _collect_and_synthesize(jobs, site, parallel)
+
+
+# ----------------------------- Full-site FAN-OUT (one LLM call per page) -----------------------------
+PAGE_AUDIT_PROMPT = """Audit this ONE web page for SEO, AEO, and GEO. Use ONLY the data below — do not invent
+facts. List the real issues and give a specific, actionable fix for each (with a concrete example), grouped
+by dimension (SEO / AEO / GEO). Be concise; this is one page among many.
+
+PAGE DATA:
+{facts}
+
+DETERMINISTIC CHECKLIST (authoritative pass/fail):
+{checklist}
+"""
+
+_PAGE_FACT_KEYS = ["url", "title", "title_length", "meta_description", "meta_description_length",
+                   "h1_count", "headings", "schema_types", "word_count", "question_headings",
+                   "list_count", "table_count", "images_total", "images_missing_alt", "canonical",
+                   "lang", "has_author", "sameas_count", "og"]
+
+
+def _page_facts(p):
+    lines = []
+    for k in _PAGE_FACT_KEYS:
+        v = p.get(k)
+        if k == "headings" and isinstance(v, list):
+            v = [h.get("text") for h in v][:15]
+        lines.append(f"{k}: {v}")
+    lines.append("content_excerpt: " + (p.get("content", "")[:800]))
+    return "\n".join(lines)
+
+
+def audit_one_page(domain, url):
+    """Single LLM call auditing one page across all 3 dimensions (facts injected, no tools/ReAct)."""
+    p = redis_store.get_page(domain, url) or {}
+    checklist = "\n".join([analysis.seo_checklist(domain, url),
+                           analysis.aeo_checklist(domain, url),
+                           analysis.geo_checklist(domain, url)])
+    out = _llm().invoke(PAGE_AUDIT_PROMPT.format(facts=_page_facts(p), checklist=checklist)).content
+    return out
+
+
+def run_site_audit_fanout(domain, concurrency=8):
+    """Hybrid full-site audit: deterministic per-dimension coverage (every page) + one LLM audit per page
+    (fanned out in parallel). Scores are deterministic (consistent across runs)."""
+    _prewarm(domain)
+    pages = redis_store.page_urls(domain)
+
+    page_reports = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(audit_one_page, domain, u): u for u in pages}
+        for fut in futures:
+            u = futures[fut]
+            try:
+                page_reports[u] = fut.result()
+            except Exception as e:
+                page_reports[u] = f"(audit failed: {e})"
+
+    scores = analysis.dimension_scores(domain)
+    vals = [s for s in scores.values() if s is not None]
+    composite = round(sum(vals) / len(vals)) if vals else None
+    sections = {dim: analysis.issue_breakdown(domain, dim) for dim in ("SEO", "AEO", "GEO")}
+    try:
+        summary = synthesize(f"the site {domain} ({len(pages)} pages)", sections, scores, composite)
+    except Exception as e:
+        summary = f"(Executive summary unavailable: {e})"
+    return {"sections": sections, "scores": scores, "composite": composite, "summary": summary,
+            "pages": page_reports, "checklists": analysis.site_summary(domain)}

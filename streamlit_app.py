@@ -9,7 +9,7 @@ import analysis
 import fixer
 import git_ops
 import redis_store
-from agent import AEO_PROMPT, GEO_PROMPT, SEO_PROMPT, run_full_audit, run_site_audit
+from agent import AEO_PROMPT, GEO_PROMPT, SEO_PROMPT, run_full_audit, run_site_audit_fanout
 from crawler import crawl_site, scan_page
 
 st.set_page_config(page_title="SEO + GEO + AEO Multi-Agent Audit", page_icon="🔍", layout="wide")
@@ -72,14 +72,16 @@ if st.button("Run Full Audit", type="primary"):
             st.error(result["error"])
             st.stop()
         domain = result["domain"]
-        with st.spinner(f"Auditing {result['pages_crawled']} pages with SEO, AEO & GEO agents..."):
-            out = run_site_audit(domain, reflect)
+        with st.spinner(f"Auditing all {result['pages_crawled']} pages (deterministic checks + one LLM "
+                        "pass per page, in parallel)..."):
+            out = run_site_audit_fanout(domain)
         st.session_state["last_audit"] = {
             "mode": "site", "url": domain, "domain": domain,
             "stats": {"Pages": result["pages_crawled"]},
             "checklists": analysis.site_summary(domain),
             "sections": out["sections"], "scores": out["scores"],
             "composite": out["composite"], "summary": out["summary"],
+            "pages": out.get("pages", {}),
         }
     else:
         with st.spinner("Scanning page (content, schema, meta, robots.txt, sitemap)..."):
@@ -124,23 +126,33 @@ if audit:
 
     st.markdown(audit["summary"])
 
-    t_seo, t_aeo, t_geo, t_check = st.tabs(["SEO report", "AEO report", "GEO report",
-                                            "Site summary" if audit.get("mode") == "site" else "Checklists"])
-    with t_seo:
+    is_site = audit.get("mode") == "site"
+    tab_names = ["SEO report", "AEO report", "GEO report",
+                 "Site summary" if is_site else "Checklists"]
+    if is_site and audit.get("pages"):
+        tab_names.append(f"Per-page ({len(audit['pages'])})")
+    tabs = st.tabs(tab_names)
+    with tabs[0]:
         st.markdown(with_100(audit["sections"]["SEO"]))
-    with t_aeo:
+    with tabs[1]:
         st.markdown(with_100(audit["sections"]["AEO"]))
-    with t_geo:
+    with tabs[2]:
         st.markdown(with_100(audit["sections"]["GEO"]))
-    with t_check:
+    with tabs[3]:
         st.code(audit["checklists"])
+    if is_site and audit.get("pages"):
+        with tabs[4]:
+            st.caption("One LLM audit per crawled page (deterministic checks back the scores/sections).")
+            for url, report in audit["pages"].items():
+                with st.expander(url):
+                    st.markdown(with_100(report))
 
 
-# ----------------- Auto-Fix chat (Claude Code → PR) — only after a report exists -----------------
+# ----------------- Auto-Fix chat (Claude Code, conversational) — only after a report -----------------
 if audit:
     st.divider()
     st.header("Auto-Fix → Pull Request (Claude Code)")
-    st.caption(f"Findings source: {audit['url']} · chat with Claude to steer the fixes.")
+    st.caption(f"Findings source: {audit['url']} · chat with Claude — ask, discuss, or tell it to apply fixes.")
     repo_path = st.text_input("Local repo path (a cloned Next.js repo)",
                               value=st.session_state.get("repo_path", ""))
     base = st.text_input("PR base branch", value="master")
@@ -150,12 +162,17 @@ if audit:
     repo_ok = bool(rp) and git_ops.is_git_repo(rp)
     changes = repo_ok and git_ops.has_changes(rp)
 
+    if st.session_state.get("chat_session_id") and st.button("🗨️ New conversation"):
+        st.session_state["chat_session_id"] = None
+        st.session_state["fix_chat"] = []
+        st.rerun()
+
     # --- conversation history ---
     for m in st.session_state["fix_chat"]:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    # --- current uncommitted changes + PR controls ---
+    # --- pending changes + PR controls ---
     if changes:
         files = git_ops.changed_files(rp)
         with st.expander(f"📝 Pending changes on `{fixer.FIX_BRANCH}` ({len(files)} file(s))", expanded=True):
@@ -180,46 +197,52 @@ if audit:
             git_ops.discard(rp)
             st.rerun()
 
-    # --- chat input (pinned to the bottom; report scrolls above) ---
-    guidance = st.chat_input("Tell Claude what to fix or how (e.g. 'shorten titles on /erp/*, "
-                             "add author to /blog, leave /privacy alone') — or just send to fix everything.")
-    if guidance is not None:
+    # --- chat input (pinned to the bottom) ---
+    msg = st.chat_input("Ask about a finding, discuss an approach, or tell Claude to apply a fix "
+                        "(e.g. 'why is the GEO score low?' or 'shorten the /erp title').")
+    if msg:
         if not (repo_path and git_ops.is_git_repo(repo_path)):
             st.error("Enter a valid local repo path above first.")
             st.stop()
         st.session_state["repo_path"] = repo_path
-        if not git_ops.has_changes(repo_path):           # clean tree => start a fresh fix cycle on the branch
+        first_turn = not st.session_state.get("chat_session_id")
+        # Get on the fix branch at the start of a conversation (clean tree) so any edits land there.
+        if first_turn and not git_ops.has_changes(repo_path):
             try:
                 fixer.prepare_branch(repo_path, base=base)
             except Exception as e:
                 st.error(f"Could not prepare branch: {e}")
                 st.stop()
 
-        user_text = guidance.strip() or "_(fix everything in the audit)_"
-        st.session_state["fix_chat"].append({"role": "user", "content": user_text})
+        st.session_state["fix_chat"].append({"role": "user", "content": msg})
         with st.chat_message("user"):
-            st.markdown(user_text)
+            st.markdown(msg)
 
         with st.chat_message("assistant"):
             final = ""
-            with st.status("Claude is working…", expanded=True) as status:
-                for ev in fixer.stream_claude_fix(repo_path, audit["sections"], audit["url"],
-                                                  audit.get("mode", "page"), guidance):
+            with st.status("Claude…", expanded=True) as status:
+                for ev in fixer.stream_claude_chat(
+                        repo_path, msg,
+                        sections=audit["sections"] if first_turn else None,
+                        url=audit["url"], mode=audit.get("mode", "page"),
+                        session_id=st.session_state.get("chat_session_id")):
                     if ev["type"] == "tool":
                         st.write(ev["text"])
                     elif ev["type"] == "thinking":
                         st.caption(ev["text"][:280])
+                    elif ev["type"] == "session":
+                        st.session_state["chat_session_id"] = ev["text"]
                     elif ev["type"] == "error":
                         st.error(ev["text"])
                     elif ev["type"] == "result":
                         final = ev["text"]
-                status.update(label="Claude finished", state="complete")
+                status.update(label="done", state="complete")
 
-            cov = re.split(r"##+\s*COVERAGE", final, maxsplit=1, flags=re.I)
-            summary = ("**Coverage**\n\n" + cov[1].strip()[:1500]) if len(cov) == 2 else (final[-1500:] or "Done.")
+            reply = final.strip() or "(no reply)"
             changed = git_ops.changed_files(repo_path) if git_ops.has_changes(repo_path) else []
-            summary += ("\n\n**Changed:** " + ", ".join(changed)) if changed else "\n\n_No file changes this run._"
-            st.markdown(summary)
+            if changed:
+                reply += "\n\n_✏️ Edited: " + ", ".join(changed) + " — review the diff above before opening a PR._"
+            st.markdown(reply)
 
-        st.session_state["fix_chat"].append({"role": "assistant", "content": summary})
+        st.session_state["fix_chat"].append({"role": "assistant", "content": reply})
         st.rerun()

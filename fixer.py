@@ -89,6 +89,7 @@ def run_claude_fix(repo_path, sections, url, mode="page", timeout=900):
     p = subprocess.run(
         [claude, "-p", "--permission-mode", "acceptEdits"],
         cwd=repo_path, input=prompt, capture_output=True, text=True, timeout=timeout,
+        encoding="utf-8", errors="replace",
     )
     return {"ok": p.returncode == 0, "output": (p.stdout or "") + (p.stderr or "")}
 
@@ -129,6 +130,7 @@ def stream_claude_fix(repo_path, sections, url, mode="page", guidance=""):
          "--output-format", "stream-json", "--verbose"],
         cwd=repo_path, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1,
+        encoding="utf-8", errors="replace",   # Claude emits UTF-8; Windows default cp1252 would crash
     )
     proc.stdin.write(prompt)
     proc.stdin.close()
@@ -154,6 +156,78 @@ def stream_claude_fix(repo_path, sections, url, mode="page", guidance=""):
     yield {"type": "result", "text": final}
 
 
+CHAT_SYSTEM = """You are a conversational engineering assistant helping the user improve the SEO / AEO / GEO
+of THIS Next.js (App Router) repository. You have the codebase, and an SEO/AEO/GEO audit is given at the start.
+
+How to behave:
+- Hold a NORMAL back-and-forth: answer questions, explain findings and WHY a fix matters, propose options,
+  discuss trade-offs, take the user's preferences.
+- ONLY edit files when the user clearly asks you to apply a change ("fix it", "do that", "apply", "go ahead").
+  If they are just asking or chatting, DO NOT edit anything — reply in words.
+- When you DO edit: minimal, correct, valid TS/JS, match existing style; map page URLs to their app/<route>
+  files; for site-wide issues prefer a shared layout. Never fabricate facts (author names, metrics, dates) —
+  ask the user instead.
+- Never run git or shell commands; only read and edit files.
+Keep replies concise and concrete."""
+
+
+def stream_claude_chat(repo_path, message, sections=None, url="", mode="page", session_id=None):
+    """Conversational Claude Code in the repo. First call (session_id=None) seeds the audit + system
+    prompt; later calls resume the same session so context persists. Yields dicts:
+    {'type': 'session'|'tool'|'thinking'|'result'|'error', 'text': ...}. Claude only edits when asked."""
+    claude = shutil.which("claude") or shutil.which("claude.exe")
+    if not claude:
+        yield {"type": "error", "text": "claude CLI not found on PATH."}
+        return
+
+    cmd = [claude, "-p", "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "acceptEdits"]
+    if session_id:
+        cmd += ["--resume", session_id]
+        stdin = message
+    else:
+        cmd += ["--append-system-prompt", CHAT_SYSTEM]
+        reports = "\n\n".join(f"### {dim}\n{txt}" for dim, txt in (sections or {}).items())
+        scope = ("This is a WHOLE-SITE audit — issues span many routes."
+                 if mode == "site" else "This audit is for a single page.")
+        stdin = (f"Here is an SEO/AEO/GEO audit of {url}. {scope}\nUse it as context for our conversation; "
+                 f"don't change anything yet.\n\n{reports}\n\n---\nUser: {message}")
+
+    proc = subprocess.Popen(
+        cmd, cwd=repo_path, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="replace",
+    )
+    proc.stdin.write(stdin)
+    proc.stdin.close()
+
+    sid, final = session_id, ""
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        t = ev.get("type")
+        if t == "system" and ev.get("session_id") and not sid:
+            sid = ev["session_id"]
+            yield {"type": "session", "text": sid}
+        elif t == "assistant":
+            for item in ev.get("message", {}).get("content", []):
+                if item.get("type") == "text" and item.get("text", "").strip():
+                    yield {"type": "thinking", "text": item["text"].strip()}
+                elif item.get("type") == "tool_use":
+                    yield {"type": "tool", "text": _describe_tool(item.get("name"), item.get("input"))}
+        elif t == "result":
+            final = ev.get("result", "") or final
+            if ev.get("session_id"):
+                sid = ev["session_id"]
+    proc.wait()
+    yield {"type": "session", "text": sid}
+    yield {"type": "result", "text": final}
+
+
 def verify_build(repo_path, timeout=900):
     """Run npm install + next build. Returns (ok, log_tail). Advisory only."""
     if not (shutil.which("npm") or shutil.which("npm.cmd")):
@@ -161,7 +235,7 @@ def verify_build(repo_path, timeout=900):
 
     def _npm(cmd):
         return subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True,
-                              timeout=timeout, shell=True)
+                              timeout=timeout, shell=True, encoding="utf-8", errors="replace")
 
     try:
         inst = _npm("npm install --legacy-peer-deps")

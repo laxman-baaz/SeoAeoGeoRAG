@@ -132,3 +132,82 @@ def pages_with_issue(domain, issue, limit=50):
     if len(hits) > len(shown):
         body += f"\n... and {len(hits) - len(shown)} more"
     return f"{len(hits)} page(s) with {issue}:\n{body}"
+
+
+# ----------------------------- Fan-out helpers (deterministic backbone) -----------------------------
+# Which site issues belong to which dimension (for deterministic scoring + breakdowns).
+_DIM_ISSUES = {
+    "SEO": ["missing_meta_description", "short_meta_description", "missing_title", "title_too_long",
+            "missing_h1", "multiple_h1", "missing_canonical", "noindex", "missing_open_graph",
+            "images_missing_alt", "thin_content"],
+    "AEO": ["no_question_headings", "no_faq_schema"],
+    "GEO": ["missing_schema", "no_organization_schema", "no_author_signal"],
+}
+
+
+def dimension_scores(domain):
+    """Deterministic 0-100 per dimension = % of (page x check) that pass. Same input -> same score."""
+    pages = list(redis_store.iter_pages(domain))
+    n = len(pages) or 1
+    scores = {}
+    for dim, issues in _DIM_ISSUES.items():
+        total = len(issues) * n
+        failed = sum(sum(1 for p in pages if SITE_ISSUES[iss](p)) for iss in issues)
+        scores[dim] = round(100 * (1 - failed / total)) if total else None
+    return scores
+
+
+# Human-readable title, why it matters, and a concrete fix example per issue.
+ISSUE_INFO = {
+    "missing_meta_description": ("Missing meta description", "No SERP snippet text — lower click-through.",
+        'Add a 120-160 char description with a keyword + CTA, e.g. `description: "Custom ERP for enterprises — strategy, build & support. Book a call."`'),
+    "short_meta_description": ("Meta description too short", "Under 120 chars wastes SERP space.",
+        "Expand the description to 120-160 chars including a keyword and a benefit/CTA."),
+    "missing_title": ("Missing title tag", "No clickable SERP headline.",
+        "Add a 50-60 char title, primary keyword first, brand last."),
+    "title_too_long": ("Title too long (>60 chars)", "Truncates in the SERP.",
+        "Trim to 50-60 chars, e.g. `Custom ERP Development for Enterprises | Baaz`."),
+    "missing_h1": ("Missing H1", "No clear page topic for crawlers.", "Add one descriptive `<h1>`."),
+    "multiple_h1": ("Multiple H1s", "Dilutes the page's main topic.",
+        "Keep one `<h1>`; demote the rest to `<h2>`/`<h3>`."),
+    "missing_canonical": ("Missing canonical", "Risks duplicate-content dilution.",
+        'Add a self-referencing canonical:\n```html\n<link rel="canonical" href="https://baaz.pro/your-path" />\n```'),
+    "noindex": ("Set to noindex", "Excluded from search results.",
+        "Remove the noindex directive if the page should rank."),
+    "missing_open_graph": ("Missing Open Graph tags", "Poor link previews on social/AI surfaces.",
+        "Add `og:title`, `og:description`, and `og:image`."),
+    "images_missing_alt": ("Images missing alt text", "Hurts accessibility + image SEO.",
+        "Add descriptive `alt` text to each image."),
+    "thin_content": ("Thin content (<300 words)", "Too little to rank or be cited.",
+        "Expand with substantive, specific content (aim for 600+ words on key pages)."),
+    "no_question_headings": ("No question-style headings", "Answer engines lift answers under question headings.",
+        'Add H2s phrased as real questions ("How do I …?") with a self-contained 40-60 word answer beneath each.'),
+    "no_faq_schema": ("No FAQ/Q&A schema", "Misses FAQ rich results + AI answer extraction.",
+        'Add FAQPage JSON-LD:\n```json\n{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"…?","acceptedAnswer":{"@type":"Answer","text":"…"}}]}\n```'),
+    "missing_schema": ("No structured data (JSON-LD)", "LLMs rely on schema to understand the page.",
+        "Add relevant JSON-LD (Article / WebPage / Organization)."),
+    "no_organization_schema": ("No Organization schema", "Your brand isn't a recognized entity to LLMs.",
+        'Add Organization JSON-LD with a `sameAs` array (best in the root layout so it covers all pages):\n```json\n{"@context":"https://schema.org","@type":"Organization","name":"Baaz","url":"https://baaz.pro","sameAs":["https://www.linkedin.com/company/baaz"]}\n```'),
+    "no_author_signal": ("No author / Person signal", "Weakens E-E-A-T and citation trust.",
+        'Add an author (`<meta name="author" …>` or an `author`/`Person` in the page schema).'),
+}
+
+
+def issue_breakdown(domain, dim, limit_urls=8):
+    """Clean, deterministic per-dimension report: each issue -> title, why, fix example, affected pages."""
+    pages = list(redis_store.iter_pages(domain))
+    blocks = []
+    for iss in _DIM_ISSUES[dim]:
+        hits = [p["url"] for p in pages if SITE_ISSUES[iss](p)]
+        if not hits:
+            continue
+        title, why, fix = ISSUE_INFO.get(iss, (iss, "", ""))
+        shown = hits[:limit_urls]
+        more = f"\n- …and {len(hits) - len(shown)} more" if len(hits) > len(shown) else ""
+        blocks.append(
+            f"#### {title} · {len(hits)} page(s)\n"
+            f"*{why}*\n\n"
+            f"**Fix:** {fix}\n\n"
+            f"**Affected pages:**\n" + "\n".join(f"- {u}" for u in shown) + more
+        )
+    return "\n\n".join(blocks) if blocks else f"✅ No {dim} issues found across the crawled pages."
